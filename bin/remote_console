@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+
+MEMORY_LIMIT="$1"
+CONFIG="$(ruby -r erb -r yaml -r json -e 'puts YAML.load(ERB.new(File.read("config/remote_console.yml")).result).to_json')"
+
+get_config() {
+  echo $CONFIG | jq -r $1
+}
+
+AMI_ID="$(get_config '.instance.ami')"
+KEYPAIR="$(get_config '.instance.keypair_name')"
+AWS_ACCOUNT_ID="$(get_config '.aws.account_id')"
+AWS_REGION="$(get_config '.aws.region')"
+DOCKER_IMAGE_NAME="$(get_config '.docker.image_name')"
+SSH_KEY="$(get_config '.instance.ssh_key')"
+ECS_TASK_SECURITY_GROUP_NAME="$(get_config '.ecs.security_group')"
+ECS_TASK_NAME="$(get_config '.ecs.name')"
+ECS_TASK_EXECUTION_ROLE="$(get_config '.ecs.execution_role')"
+SSHABLE_SECURITY_GROUP="$(get_config '.instance.sshable_security_group')"
+VPC_NAME="$(get_config '.instance.vpc_name')"
+PUBLIC_SUBNET_NAME="$(get_config '.instance.public_subnet_name')"
+DATABASE_PORT="$(get_config '.instance.database_port')"
+DATABASE_PORT="${DATABASE_PORT:-5432}"
+
+# Required:
+# - AWS CLI configured with JSON output
+# - Create EC2 keypair with your local username
+
+function cleanup() {
+  echo "Cleaning up resources"
+  if kill -0 "$database_pid" 2> /dev/null; then
+    kill "$database_pid"
+  fi
+  if kill -0 "$redis_pid" 2> /dev/null; then
+    kill "$redis_pid"
+  fi
+  aws ec2 terminate-instances --instance-ids $id
+}
+trap cleanup EXIT
+
+set -e
+
+# Install brew dependencies
+has_formula_installed()
+{
+  formula=$1
+  ! brew info "$formula" | grep "^Not installed$"
+}
+
+install_formula()
+{
+  formula=$1
+  if ! has_formula_installed "$formula"; then
+    echo "Install brew:$formula"
+    brew install "$formula"
+  fi
+}
+
+open_port()
+{
+  echo $(python -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
+}
+
+install_formula "jq"
+install_formula "nmap"
+
+# Check for keypair and permissions
+if [ ! -f $SSH_KEY ] ; then
+  echo "Missing $SSH_KEY keypair"
+  exit 1
+fi
+
+if [ "$(stat -f '%A %a %N' $SSH_KEY | awk '{ print $1 }')" != "600" ] ; then
+  echo "Fixing $SSH_KEY permissions"
+  chmod 600 $SSH_KEY
+fi
+
+if [ ! -z "$MEMORY_LIMIT" ]; then
+  MEMORY_LIMIT="-m ${MEMORY_LIMIT}g"
+fi
+
+# Get VPC
+vpc_id="$(aws ec2 describe-vpcs --filters="Name=tag:Name,Values=$VPC_NAME" | awk '/VpcId/{ print $2 }' | tr -d '",')"
+
+# Get subnet
+subnet_id="$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$vpc_id" "Name=tag:Name,Values=$PUBLIC_SUBNET_NAME" | awk '/SubnetId/{ print $2 }' | tr -d '",' | head -1)"
+
+# Get security group
+security_group_id="$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$vpc_id" "Name=group-name,Values=$ECS_TASK_SECURITY_GROUP_NAME" | jq -r '.SecurityGroups[0].GroupId')"
+ssh_group_id="$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$vpc_id" "Name=group-name,Values=$SSHABLE_SECURITY_GROUP" | jq -r '.SecurityGroups[0].GroupId')"
+
+echo "Using security groups: ecs:$security_group_id sshable:$ssh_group_id"
+
+echo "Creating instance"
+id="$(aws ec2 run-instances --image-id $AMI_ID --count 1 --instance-type t2.micro --key-name $KEYPAIR --security-group-ids $security_group_id $ssh_group_id --subnet-id $subnet_id | awk '/InstanceId/{ print $2 }' | tr -d '",')"
+
+ip=""
+
+while [ -z "$ip" ]; do
+  ip="$(aws ec2 describe-instances --filters "Name=instance-id,Values=$id" | awk '/PublicIp/{ print $2 }' | head -1 | tr -d '",')"
+  sleep 5
+done
+
+while ! (nmap $ip -PN -p ssh | grep open > /dev/null) ; do
+  printf '.'
+  sleep 1
+done
+echo
+
+task_definition="$(aws ecs list-task-definitions | grep $ECS_TASK_NAME | tail -1 | tr -d '", ')"
+database_host="$(aws ecs describe-task-definition --task-definition $task_definition | jq -r '.taskDefinition.containerDefinitions[0].environment | from_entries | .DATABASE_URL' | awk -F"[/:@]" '{print $6}')"
+redis_host="$(aws ecs describe-task-definition --task-definition $task_definition | jq -r '.taskDefinition.containerDefinitions[0].environment | from_entries | .REDIS_URL' | awk -F"[/:@]" '{print $4}')"
+
+
+db_port="$(open_port)"
+redis_port="$(open_port)"
+echo "Forwarding local port $db_port to $database_host:$DATABASE_PORT"
+ssh -o "StrictHostKeyChecking=no" -N -T -i $SSH_KEY -L $db_port:$database_host:$DATABASE_PORT ec2-user@$ip & database_pid=$!
+echo "Forwarding local port $redis_port to $redis_host:6379"
+ssh -o "StrictHostKeyChecking=no" -N -T -i $SSH_KEY -L $redis_port:$redis_host:6379 ec2-user@$ip & redis_pid=$!
+
+echo
+echo "Public IP: $ip"
+
+echo "Downloading latest docker image"
+aws ecr get-login-password --region $AWS_REGION | docker login --password-stdin -u AWS https://$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+image="$(aws ecr describe-repositories | awk "/Uri.+$DOCKER_IMAGE_NAME/{ print \$2 }" | tr -d '",')"
+echo "Found image $image"
+
+database_url="$(aws ecs describe-task-definition --task-definition $task_definition | jq -r '.taskDefinition.containerDefinitions[0].environment | from_entries | .DATABASE_URL' | sed "s/$database_host:$DATABASE_PORT/host.docker.internal:$db_port/")"
+redis_url="$(aws ecs describe-task-definition --task-definition $task_definition | jq -r '.taskDefinition.containerDefinitions[0].environment | from_entries | .REDIS_URL' | sed "s/$redis_host:6379/host.docker.internal:$redis_port/")"
+echo "Found database and redis URLs"
+
+echo "Pulling latest docker image"
+docker pull $image
+
+role="arn:aws:iam::$AWS_ACCOUNT_ID:role/$ECS_TASK_EXECUTION_ROLE"
+echo "Fetching AWS credentials role: $role"
+export $(aws sts assume-role --role-arn $role --role-session-name 'remote_console' | jq -r ".Credentials|to_entries|map(\"\(.key)=\(.value|tostring)\")|.[]")
+
+echo "Running docker image"
+docker run --rm -it \
+  -e "DATABASE_URL=$database_url" \
+  -e "REDIS_URL=$redis_url" \
+  -e "AWS_ACCESS_KEY_ID=$AccessKeyId" \
+  -e "AWS_SECRET_ACCESS_KEY=$SecretAccessKey" \
+  -e "AWS_SESSION_TOKEN=$SessionToken" \
+  -v "$PWD/tmp/docker_data:/tmp/docker_data" \
+  $MEMORY_LIMIT \
+  $image rails c
