@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
 
+while getopts ":ht" opt; do
+  case ${opt} in
+    h )
+      echo "usage: remote-rails [-h]"
+      exit
+      # TODO
+      ;;
+  esac
+done
+shift $((OPTIND -1))
+
 MEMORY_LIMIT="$1"
 CONFIG="$(ruby -r erb -r yaml -r json -e 'puts YAML.load(ERB.new(File.read("config/remote_console.yml")).result).to_json')"
 
