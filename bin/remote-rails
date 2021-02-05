@@ -1,18 +1,29 @@
 #!/usr/bin/env bash
 
-while getopts ":ht" opt; do
+function usage() {
+  echo "usage: remote-rails [-h] [-m 2] [-c path/to/config.yml] COMMAND"
+  exit 0
+}
+
+while getopts ":hm:c:" opt; do
   case ${opt} in
-    h )
-      echo "usage: remote-rails [-h]"
-      exit
-      # TODO
+    m )
+      MEMORY_LIMIT="$OPTARG"
       ;;
+    c )
+      CONFIG_PATH="$OPTARG"
+      ;;
+    h )
+      usage
+      ;;
+    \? )
+      usage
   esac
 done
 shift $((OPTIND -1))
 
-MEMORY_LIMIT="$1"
-CONFIG="$(ruby -r erb -r yaml -r json -e 'puts YAML.load(ERB.new(File.read("config/remote_console.yml")).result).to_json')"
+CONFIG_PATH="${CONFIG_PATH:-"config/remote_console.yml"}"
+CONFIG=$(ruby -r erb -r yaml -r json -e "puts YAML.load(ERB.new(File.read('$CONFIG_PATH')).result).to_json")
 
 get_config() {
   echo $CONFIG | jq -r $1
