@@ -22,7 +22,9 @@ while getopts ":hm:c:" opt; do
 done
 shift $((OPTIND -1))
 
-CONFIG_PATH="${CONFIG_PATH:-"config/remote_console.yml"}"
+COMMAND=$1 ; shift
+
+CONFIG_PATH="${CONFIG_PATH:-"config/remote_rails.yml"}"
 CONFIG=$(ruby -r erb -r yaml -r json -e "puts YAML.load(ERB.new(File.read('$CONFIG_PATH')).result).to_json")
 
 get_config() {
@@ -62,29 +64,10 @@ trap cleanup EXIT
 
 set -e
 
-# Install brew dependencies
-has_formula_installed()
-{
-  formula=$1
-  ! brew info "$formula" | grep "^Not installed$"
-}
-
-install_formula()
-{
-  formula=$1
-  if ! has_formula_installed "$formula"; then
-    echo "Install brew:$formula"
-    brew install "$formula"
-  fi
-}
-
 open_port()
 {
   echo $(python -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
 }
-
-install_formula "jq"
-install_formula "nmap"
 
 # Check for keypair and permissions
 if [ ! -f $SSH_KEY ] ; then
@@ -170,4 +153,4 @@ docker run --rm -it \
   -e "AWS_SESSION_TOKEN=$SessionToken" \
   -v "$PWD/tmp/docker_data:/tmp/docker_data" \
   $MEMORY_LIMIT \
-  $image rails c
+  $image rails $@
