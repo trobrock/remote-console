@@ -22,8 +22,6 @@ while getopts ":hm:c:" opt; do
 done
 shift $((OPTIND -1))
 
-COMMAND=$1 ; shift
-
 CONFIG_PATH="${CONFIG_PATH:-"config/remote_rails.yml"}"
 CONFIG=$(ruby -r erb -r yaml -r json -e "puts YAML.load(ERB.new(File.read('$CONFIG_PATH')).result).to_json")
 
